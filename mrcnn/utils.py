@@ -9,6 +9,7 @@ Written by Waleed Abdulla
 
 import sys
 import os
+import logging
 import math
 import random
 import numpy as np
@@ -20,6 +21,7 @@ import skimage.transform
 import urllib.request
 import shutil
 import warnings
+from distutils.version import LooseVersion
 
 # URL from which to download the latest COCO trained weights
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
@@ -63,7 +65,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
     boxes_area: array of length boxes_count.
 
     Note: the areas are passed in rather than calculated here for
-          efficency. Calculate once in the caller to avoid duplicate work.
+    efficiency. Calculate once in the caller to avoid duplicate work.
     """
     # Calculate intersection areas
     y1 = np.maximum(box[0], boxes[:, 0])
@@ -96,10 +98,14 @@ def compute_overlaps(boxes1, boxes2):
 
 
 def compute_overlaps_masks(masks1, masks2):
-    '''Computes IoU overlaps between two sets of masks.
+    """Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Height, Width, instances]
-    '''
-    # flatten masks
+    """
+    
+    # If either set of masks is empty return empty result
+    if masks1.shape[-1] == 0 or masks2.shape[-1] == 0:
+        return np.zeros((masks1.shape[-1], masks2.shape[-1]))
+    # flatten masks and compute their areas
     masks1 = np.reshape(masks1 > .5, (-1, masks1.shape[-1])).astype(np.float32)
     masks2 = np.reshape(masks2 > .5, (-1, masks2.shape[-1])).astype(np.float32)
     area1 = np.sum(masks1, axis=0)
@@ -114,7 +120,7 @@ def compute_overlaps_masks(masks1, masks2):
 
 
 def non_max_suppression(boxes, scores, threshold):
-    """Performs non-maximum supression and returns indicies of kept boxes.
+    """Performs non-maximum suppression and returns indices of kept boxes.
     boxes: [N, (y1, x1, y2, x2)]. Notice that (y2, x2) lays outside the box.
     scores: 1-D array of box scores.
     threshold: Float. IoU threshold to use for filtering.
@@ -141,10 +147,10 @@ def non_max_suppression(boxes, scores, threshold):
         # Compute IoU of the picked box with the rest
         iou = compute_iou(boxes[i], boxes[ixs[1:]], area[i], area[ixs[1:]])
         # Identify boxes with IoU over the threshold. This
-        # returns indicies into ixs[1:], so add 1 to get
-        # indicies into ixs.
+        # returns indices into ixs[1:], so add 1 to get
+        # indices into ixs.
         remove_ixs = np.where(iou > threshold)[0] + 1
-        # Remove indicies of the picked and overlapped boxes.
+        # Remove indices of the picked and overlapped boxes.
         ixs = np.delete(ixs, remove_ixs)
         ixs = np.delete(ixs, 0)
     return np.array(pick, dtype=np.int32)
@@ -303,8 +309,11 @@ class Dataset(object):
         self.num_images = len(self.image_info)
         self._image_ids = np.arange(self.num_images)
 
+        # Mapping from source class and image IDs to internal IDs
         self.class_from_source_map = {"{}.{}".format(info['source'], info['id']): id
                                       for info, id in zip(self.class_info, self.class_ids)}
+        self.image_from_source_map = {"{}.{}".format(info['source'], info['id']): id
+                                      for info, id in zip(self.image_info, self.image_ids)}
 
         # Map sources to class_ids they support
         self.sources = list(set([i['source'] for i in self.class_info]))
@@ -332,24 +341,13 @@ class Dataset(object):
         assert info['source'] == source
         return info['id']
 
-    def append_data(self, class_info, image_info):
-        self.external_to_class_id = {}
-        for i, c in enumerate(self.class_info):
-            for ds, id in c["map"]:
-                self.external_to_class_id[ds + str(id)] = i
-
-        # Map external image IDs to internal ones.
-        self.external_to_image_id = {}
-        for i, info in enumerate(self.image_info):
-            self.external_to_image_id[info["ds"] + str(info["id"])] = i
-
     @property
     def image_ids(self):
         return self._image_ids
 
     def source_image_link(self, image_id):
         """Returns the path or URL to the image.
-        Override this to return a URL to the image if it's availble online for easy
+        Override this to return a URL to the image if it's available online for easy
         debugging.
         """
         return self.image_info[image_id]["path"]
@@ -381,27 +379,34 @@ class Dataset(object):
         """
         # Override this function to load a mask from your dataset.
         # Otherwise, it returns an empty mask.
+        logging.warning("You are using the default load_mask(), maybe you need to define your own one.")
         mask = np.empty([0, 0, 0])
         class_ids = np.empty([0], np.int32)
         return mask, class_ids
 
 
-def resize_image(image, min_dim=None, max_dim=None, mode="square"):
+def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
     """Resizes an image keeping the aspect ratio unchanged.
 
     min_dim: if provided, resizes the image such that it's smaller
         dimension == min_dim
     max_dim: if provided, ensures that the image longest side doesn't
         exceed this value.
+    min_scale: if provided, ensure that the image is scaled up by at least
+        this percent even if min_dim doesn't require it.
     mode: Resizing mode.
         none: No resizing. Return the image unchanged.
         square: Resize and pad with zeros to get a square image
             of size [max_dim, max_dim].
         pad64: Pads width and height with zeros to make them multiples of 64.
-               If min_dim is provided, it scales the small side to >= min_dim
+               If min_dim or min_scale are provided, it scales the image up
                before padding. max_dim is ignored in this mode.
                The multiple of 64 is needed to ensure smooth scaling of feature
                maps up and down the 6 levels of the FPN pyramid (2**6=64).
+        crop: Picks random crops from the image. First, scales the image based
+              on min_dim and min_scale, then picks a random crop of
+              size min_dim x min_dim. Can be used in training only.
+              max_dim is not used in this mode.
 
     Returns:
     image: the resized image
@@ -419,14 +424,18 @@ def resize_image(image, min_dim=None, max_dim=None, mode="square"):
     window = (0, 0, h, w)
     scale = 1
     padding = [(0, 0), (0, 0), (0, 0)]
+    crop = None
 
     if mode == "none":
-        return image, window, scale, padding
+        return image, window, scale, padding, crop
 
     # Scale?
     if min_dim:
         # Scale up but not down
         scale = max(1, min_dim / min(h, w))
+    if min_scale and scale < min_scale:
+        scale = min_scale
+
     # Does it exceed max dim?
     if max_dim and mode == "square":
         image_max = max(h, w)
@@ -435,10 +444,10 @@ def resize_image(image, min_dim=None, max_dim=None, mode="square"):
 
     # Resize image using bilinear interpolation
     if scale != 1:
-        image = skimage.transform.resize(
-            image, (round(h * scale), round(w * scale)),
-            order=1, mode="constant", preserve_range=True)
-    # Need padding?
+        image = resize(image, (round(h * scale), round(w * scale)),
+                       preserve_range=True)
+
+    # Need padding or cropping?
     if mode == "square":
         # Get new height and width
         h, w = image.shape[:2]
@@ -470,12 +479,20 @@ def resize_image(image, min_dim=None, max_dim=None, mode="square"):
         padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
         image = np.pad(image, padding, mode='constant', constant_values=0)
         window = (top_pad, left_pad, h + top_pad, w + left_pad)
+    elif mode == "crop":
+        # Pick a random crop
+        h, w = image.shape[:2]
+        y = random.randint(0, (h - min_dim))
+        x = random.randint(0, (w - min_dim))
+        crop = (y, x, min_dim, min_dim)
+        image = image[y:y + min_dim, x:x + min_dim]
+        window = (0, 0, min_dim, min_dim)
     else:
         raise Exception("Mode {} not supported".format(mode))
-    return image.astype(image_dtype), window, scale, padding
+    return image.astype(image_dtype), window, scale, padding, crop
 
 
-def resize_mask(mask, scale, padding):
+def resize_mask(mask, scale, padding, crop=None):
     """Resizes a mask using the given scale and padding.
     Typically, you get the scale and padding from resize_image() to
     ensure both, the image and the mask, are resized consistently.
@@ -489,7 +506,11 @@ def resize_mask(mask, scale, padding):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
-    mask = np.pad(mask, padding, mode='constant', constant_values=0)
+    if crop is not None:
+        y, x, h, w = crop
+        mask = mask[y:y + h, x:x + w]
+    else:
+        mask = np.pad(mask, padding, mode='constant', constant_values=0)
     return mask
 
 
@@ -508,7 +529,7 @@ def minimize_mask(bbox, mask, mini_shape):
         if m.size == 0:
             raise Exception("Invalid bounding box with area of zero")
         # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, mini_shape, order=1, mode="constant")
+        m = resize(m, mini_shape)
         mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
@@ -526,7 +547,7 @@ def expand_mask(bbox, mini_mask, image_shape):
         h = y2 - y1
         w = x2 - x1
         # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, (h, w), order=1, mode="constant")
+        m = resize(m, (h, w))
         mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
     return mask
 
@@ -546,7 +567,7 @@ def unmold_mask(mask, bbox, image_shape):
     """
     threshold = 0.5
     y1, x1, y2, x2 = bbox
-    mask = skimage.transform.resize(mask, (y2 - y1, x2 - x1), order=1, mode="constant")
+    mask = resize(mask, (y2 - y1, x2 - x1))
     mask = np.where(mask >= threshold, 1, 0).astype(np.bool)
 
     # Put the mask in the right location.
@@ -675,7 +696,7 @@ def compute_matches(gt_boxes, gt_class_ids, gt_masks,
         # 3. Find the match
         for j in sorted_ixs:
             # If ground truth box is already matched, go to next one
-            if gt_match[j] > 0:
+            if gt_match[j] > -1:
                 continue
             # If we reach IoU smaller than the threshold, end the loop
             iou = overlaps[i, j]
@@ -728,6 +749,30 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
                  precisions[indices])
 
     return mAP, precisions, recalls, overlaps
+
+
+def compute_ap_range(gt_box, gt_class_id, gt_mask,
+                     pred_box, pred_class_id, pred_score, pred_mask,
+                     iou_thresholds=None, verbose=1):
+    """Compute AP over a range or IoU thresholds. Default range is 0.5-0.95."""
+    # Default is 0.5 to 0.95 with increments of 0.05
+    iou_thresholds = iou_thresholds or np.arange(0.5, 1.0, 0.05)
+    
+    # Compute AP over range of IoU thresholds
+    AP = []
+    for iou_threshold in iou_thresholds:
+        ap, precisions, recalls, overlaps =\
+            compute_ap(gt_box, gt_class_id, gt_mask,
+                        pred_box, pred_class_id, pred_score, pred_mask,
+                        iou_threshold=iou_threshold)
+        if verbose:
+            print("AP @{:.2f}:\t {:.3f}".format(iou_threshold, ap))
+        AP.append(ap)
+    AP = np.array(AP).mean()
+    if verbose:
+        print("AP @{:.2f}-{:.2f}:\t {:.3f}".format(
+            iou_thresholds[0], iou_thresholds[-1], AP))
+    return AP
 
 
 def compute_recall(pred_boxes, gt_boxes, iou):
@@ -837,3 +882,27 @@ def denorm_boxes(boxes, shape):
     scale = np.array([h - 1, w - 1, h - 1, w - 1])
     shift = np.array([0, 0, 1, 1])
     return np.around(np.multiply(boxes, scale) + shift).astype(np.int32)
+
+
+def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
+           preserve_range=False, anti_aliasing=False, anti_aliasing_sigma=None):
+    """A wrapper for Scikit-Image resize().
+
+    Scikit-Image generates warnings on every call to resize() if it doesn't
+    receive the right parameters. The right parameters depend on the version
+    of skimage. This solves the problem by using different parameters per
+    version. And it provides a central place to control resizing defaults.
+    """
+    if LooseVersion(skimage.__version__) >= LooseVersion("0.14"):
+        # New in 0.14: anti_aliasing. Default it to False for backward
+        # compatibility with skimage 0.13.
+        return skimage.transform.resize(
+            image, output_shape,
+            order=order, mode=mode, cval=cval, clip=clip,
+            preserve_range=preserve_range, anti_aliasing=anti_aliasing,
+            anti_aliasing_sigma=anti_aliasing_sigma)
+    else:
+        return skimage.transform.resize(
+            image, output_shape,
+            order=order, mode=mode, cval=cval, clip=clip,
+            preserve_range=preserve_range)
