@@ -37,13 +37,13 @@ class MappingChallengeDataset(utils.Dataset):
 
         # register classes
         for _class_id in classIds:
-            self.add_class("crowdai-mapping-challenge", _class_id, self.coco.loadCats(_class_id)[0]["name"])
+            self.add_class("spacenet-rio-buildings", _class_id, self.coco.loadCats(_class_id)[0]["name"])
 
         # Register Images
         for _img_id in image_ids:
             assert(os.path.exists(os.path.join(image_dir, self.coco.imgs[_img_id]['file_name'])))
             self.add_image(
-                "crowdai-mapping-challenge", image_id=_img_id,
+                "spacenet-rio-buildings", image_id=_img_id,
                 path=os.path.join(image_dir, self.coco.imgs[_img_id]['file_name']),
                 width=self.coco.imgs[_img_id]["width"],
                 height=self.coco.imgs[_img_id]["height"],
@@ -70,7 +70,7 @@ class MappingChallengeDataset(utils.Dataset):
         """
 
         image_info = self.image_info[image_id]
-        assert image_info["source"] == "crowdai-mapping-challenge"
+        assert image_info["source"] == "spacenet-rio-buildings"
 
         instance_masks = []
         class_ids = []
@@ -79,7 +79,7 @@ class MappingChallengeDataset(utils.Dataset):
         # of class IDs that correspond to each channel of the mask.
         for annotation in annotations:
             class_id = self.map_source_class_id(
-                "crowdai-mapping-challenge.{}".format(annotation['category_id']))
+                "spacenet-rio-buildings.{}".format(annotation['category_id']))
             if class_id:
                 m = self.annToMask(annotation,  image_info["height"],
                                                 image_info["width"])
@@ -109,7 +109,7 @@ class MappingChallengeDataset(utils.Dataset):
             Ideally you this function is supposed to return a URL
             but in this case, we will simply return the image_id
         """
-        return "crowdai-mapping-challenge::{}".format(image_id)
+        return "spacenet-rio-buildings::{}".format(image_id)
     # The following two functions are from pycocotools with a few changes.
 
     def annToRLE(self, ann, height, width):

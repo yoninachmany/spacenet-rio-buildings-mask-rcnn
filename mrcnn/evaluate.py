@@ -26,7 +26,7 @@ def build_coco_results(dataset, image_ids, rois, class_ids, scores, masks):
 
             result = {
                 "image_id": image_id,
-                "category_id": dataset.get_source_class_id(class_id, "crowdai-mapping-challenge"),
+                "category_id": dataset.get_source_class_id(class_id, "spacenet-rio-buildings"),
                 "bbox": [bbox[1], bbox[0], bbox[3] - bbox[1], bbox[2] - bbox[0]],
                 "score": score,
                 "segmentation": maskUtils.encode(np.asfortranarray(mask)).encode('utf-8')
